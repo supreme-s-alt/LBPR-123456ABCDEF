@@ -1,0 +1,415 @@
+using Bunkum.Core;
+using Bunkum.Core.Endpoints;
+using Bunkum.Core.RateLimit;
+using Bunkum.Core.Responses;
+using Bunkum.Listener.Protocol;
+using Bunkum.Protocols.Http;
+using Refresh.Common.Constants;
+using Refresh.Core.Authentication.Permission;
+using Refresh.Core.Configuration;
+using Refresh.Core.RateLimits.Levels;
+using Refresh.Core.RateLimits.Playlists;
+using Refresh.Core.Types.Data;
+using Refresh.Database;
+using Refresh.Database.Models;
+using Refresh.Database.Models.Levels;
+using Refresh.Database.Models.Playlists;
+using Refresh.Database.Models.Users;
+using Refresh.Interfaces.Game.Types.Levels;
+using Refresh.Interfaces.Game.Types.Lists;
+using Refresh.Interfaces.Game.Types.Playlists;
+
+namespace Refresh.Interfaces.Game.Endpoints.Playlists;
+
+public class Lbp1PlaylistEndpoints : EndpointGroup
+{
+    /// <summary>
+    /// Validate the playlist icon. If it's blank, an invalid GUID or a remote asset which doesn't exist on the server, reset to blank hash
+    /// and do not return an error to not upset the game in certain cases (also because the user cannot choose the icon when creating a playlist).
+    /// </summary>
+    private string ValidateIconHash(string iconHash, DataContext dataContext)
+    {
+        if (iconHash.IsBlankHash()) 
+        {
+            return "0";
+        }
+        else if (iconHash.StartsWith('g'))
+        {
+            //Parse out the GUID
+            long guid = long.Parse(iconHash.AsSpan()[1..]);
+            
+            if (!dataContext.GuidChecker.IsTextureGuid(dataContext.Game, guid))
+            {
+                return "0";
+            }
+        }
+        else if (!dataContext.DataStore.ExistsInStore(iconHash))
+        {
+            return "0";
+        }
+
+        return iconHash;
+    }
+
+    // Creates a playlist, with an optional parent ID
+    [GameEndpoint("createPlaylist", HttpMethods.Post, ContentType.Xml)]
+    [RequireEmailVerified]
+    [RateLimitSettings(PlaylistCreationEndpointLimits.UploadTimeoutDuration, PlaylistCreationEndpointLimits.MaxCreateAmount, 
+                                PlaylistCreationEndpointLimits.UploadBlockDuration, PlaylistCreationEndpointLimits.CreateBucket)]
+    public Response CreatePlaylist(RequestContext context, DataContext dataContext, GameServerConfig config, SerializedLbp1Playlist body)
+    {
+        GameUser user = dataContext.User!;
+        
+        GamePlaylist? parent = null;
+        GamePlaylist? rootPlaylist = dataContext.Database.GetUserRootPlaylist(user);
+        EntityUploadRateLimitProperties uploadLimit = user.GetRolePermissionsForUser(config).PlaylistUploadRateLimit;
+
+        // Don't block root playlist creation, as the game will otherwise spam requests and softlock
+        if (rootPlaylist != null)
+        {
+            if (user.IsWriteBlocked(config)) return Unauthorized;
+
+            if (uploadLimit.Enabled)
+            {
+                TimeSpan? rateLimitExpiresIn = dataContext.Database.GetRemainingTimeIfUploadRateLimitReached(user, GameDatabaseEntity.Playlist, uploadLimit.UploadQuota);
+                if (rateLimitExpiresIn != null)
+                {
+                    // no need for a notification, because playlists are cheap and i don't really want the game's obscure spam bugs to cause these notifs to be spammed
+                    return Unauthorized;
+                }
+            }
+        }
+
+        // If the parent ID is specified, try to parse that out
+        if (int.TryParse(context.QueryString["parent_id"], out int parentId))
+        {
+            parent = dataContext.Database.GetPlaylistById(parentId);
+
+            // Dont try to parent to a non-existent parent playlist
+            if (parent == null)
+                return BadRequest;
+            
+            // Dont let you create a sub-playlist of someone else's playlist
+            if (user.UserId != parent.PublisherId)
+                return Unauthorized;
+
+            // If the user has no root playlist, but they are trying to create a sub-playlist, something has gone wrong.
+            if (rootPlaylist == null)
+                return BadRequest;
+        }
+
+        // Trim name and description
+        if (body.Name.Length > UgcLimits.TitleLimit) 
+            body.Name = body.Name[..UgcLimits.TitleLimit];
+
+        if (body.Description.Length > UgcLimits.DescriptionLimit)
+            body.Description = body.Description[..UgcLimits.DescriptionLimit];
+
+        // Validate icon
+        body.Icon = this.ValidateIconHash(body.Icon, dataContext);
+
+        // Create the playlist, marking it as the root playlist if the user does not have one set already
+        GamePlaylist playlist = dataContext.Database.CreatePlaylist(user, body, rootPlaylist == null);
+
+        if (rootPlaylist != null && uploadLimit.Enabled)
+        {
+            dataContext.Database.IncrementUploadRateLimitForEntity(user, GameDatabaseEntity.Playlist, uploadLimit.TimeSpanHours);
+        }
+
+        // If there is a parent, add the new playlist to the parent
+        if (parent != null) 
+            dataContext.Database.AddPlaylistToPlaylist(playlist, parent);
+        
+        // Create the new playlist, returning the data
+        return new Response(SerializedLbp1Playlist.FromOld(playlist, dataContext), ContentType.Xml);
+    }
+
+    // Gets the slots contained within a playlist
+    [GameEndpoint("playlist/{id}", HttpMethods.Get, ContentType.Xml)]
+    [NullStatusCode(NotFound)]
+    [MinimumRole(GameUserRole.Restricted)]
+    [RateLimitSettings(LevelListEndpointLimits.TimeoutDuration, LevelListEndpointLimits.RequestAmount, 
+                                LevelListEndpointLimits.BlockDuration, LevelListEndpointLimits.RequestBucket)]
+    public SerializedMinimalLevelList? GetPlaylistSlots(RequestContext context, DataContext dataContext, int id)
+    {
+        GamePlaylist? playlist = dataContext.Database.GetPlaylistById(id);
+        if (playlist == null)
+            return null;
+
+        (int skip, int count) = context.GetPageData();
+        
+        DatabaseList<GamePlaylist> subPlaylists = dataContext.Database.GetPlaylistsInPlaylist(playlist, skip, count);
+        DatabaseList<GameLevel> levels = dataContext.Database.GetLevelsInPlaylist(playlist, dataContext.Game, skip, count);                    
+
+        // Concat together the playlist's sub-playlists and levels 
+        IEnumerable<GameMinimalLevelResponse> slots =
+            GameMinimalLevelResponse.FromOldList(subPlaylists.Items.ToArray(), dataContext) // the sub-playlists
+                .Concat(GameMinimalLevelResponse.FromOldList(levels.Items.ToArray(), dataContext)); // the sub-levels
+        
+        // Convert the GameLevelResponse list down to a GameMinimalLevelResponse
+        return new SerializedMinimalLevelList(
+            slots,
+            subPlaylists.TotalItems + levels.TotalItems,
+            skip
+        );
+    }
+
+    [GameEndpoint("playlistsContainingSlotByAuthor/{slotType}/{slotId}", ContentType.Xml)]
+    [GameEndpoint("playlistsContainingSlot/{slotType}/{slotId}", ContentType.Xml)]
+    [MinimumRole(GameUserRole.Restricted)]
+    [NullStatusCode(NotFound)]
+    [RateLimitSettings(PlaylistListEndpointLimits.TimeoutDuration, PlaylistListEndpointLimits.RequestAmount, 
+                                PlaylistListEndpointLimits.BlockDuration, PlaylistListEndpointLimits.RequestBucket)]
+    public SerializedMinimalLevelList? PlaylistsContainingSlot(RequestContext context, DataContext dataContext,
+        string slotType, int slotId)
+    {
+        string? authorName = context.QueryString["author"];
+
+        GameUser? author = null; 
+        // Allow the author to be unspecified
+        if (authorName != null)
+        {
+            author = dataContext.Database.GetUserByUsername(authorName);
+            if (author == null)
+                return null;
+        }
+
+        (int skip, int count) = context.GetPageData();
+
+        // Get the playlists which contain the level/playlist, and if we have an author specified, filter it down to only playlists which are created by the author
+        // TODO: with postgres this can be IQueryable, and we dont need List
+        DatabaseList<GamePlaylist> playlists;
+        if (slotType == "playlist")
+        {
+            GamePlaylist? playlist = dataContext.Database.GetPlaylistById(slotId);
+            if (playlist == null)
+                return null;
+
+            playlists = author == null ? 
+                dataContext.Database.GetPlaylistsContainingPlaylist(playlist, skip, count) : 
+                dataContext.Database.GetPlaylistsByAuthorContainingPlaylist(author, playlist, skip, count);
+        }
+        else
+        {
+            GameLevel? level = dataContext.Database.GetLevelByIdAndType(slotType, slotId);
+            if (level == null)
+                return null;
+            
+            playlists = author == null ? 
+                dataContext.Database.GetPlaylistsContainingLevel(level, skip, count) : 
+                dataContext.Database.GetPlaylistsByAuthorContainingLevel(author, level, skip, count);
+        }
+
+        // Return the serialized playlists 
+        return new SerializedMinimalLevelList(
+            GameMinimalLevelResponse.FromOldList(playlists.Items.ToArray(), dataContext), 
+            playlists.TotalItems, 
+            skip
+        );
+    }
+
+    [GameEndpoint("setPlaylistMetaData/{id}", HttpMethods.Post, ContentType.Xml)]
+    [RequireEmailVerified]
+    [RateLimitSettings(PlaylistCreationEndpointLimits.UploadTimeoutDuration, PlaylistCreationEndpointLimits.MaxCreateAmount, 
+                                PlaylistCreationEndpointLimits.UploadBlockDuration, PlaylistCreationEndpointLimits.CreateBucket)]
+    public Response UpdatePlaylistMetadata(RequestContext context, GameServerConfig config, DataContext dataContext, GameUser user, int id, SerializedLbp1Playlist body)
+    {
+        if (user.IsWriteBlocked(config))
+            return Unauthorized;
+        
+        GamePlaylist? playlist = dataContext.Database.GetPlaylistById(id);
+        if (playlist == null)
+            return NotFound;
+
+        // Dont allow the wrong user to update playlists
+        if (playlist.PublisherId != user.UserId)
+            return Unauthorized;
+        
+        // Trim name and description
+        if (body.Name.Length > UgcLimits.TitleLimit) 
+            body.Name = body.Name[..UgcLimits.TitleLimit];
+
+        if (body.Description.Length > UgcLimits.DescriptionLimit)
+            body.Description = body.Description[..UgcLimits.DescriptionLimit];
+        
+        // Validate icon
+        body.Icon = this.ValidateIconHash(body.Icon, dataContext);
+        
+        dataContext.Database.UpdatePlaylist(playlist, body);
+        return OK;
+    }
+
+    [GameEndpoint("deletePlaylist/{id}", HttpMethods.Post)]
+    [RequireEmailVerified]
+    public Response DeletePlaylist(RequestContext context, GameDatabaseContext database, GameUser user, int id)
+    {
+        GamePlaylist? playlist = database.GetPlaylistById(id);
+        if (playlist == null)
+            return NotFound;
+
+        // Dont allow the wrong user to delete playlists
+        if (playlist.PublisherId != user.UserId)
+            return Unauthorized;
+
+        database.DeletePlaylist(playlist);
+        return OK;
+    }
+
+    [GameEndpoint("addToPlaylist/{playlistId}", HttpMethods.Post)]
+    [RequireEmailVerified]
+    [RateLimitSettings(PlaylistModificationEndpointLimits.TimeoutDuration, PlaylistModificationEndpointLimits.RequestAmount, 
+                            PlaylistModificationEndpointLimits.BlockDuration, PlaylistModificationEndpointLimits.RequestBucket)]
+    public Response AddSlotToPlaylist(RequestContext context, GameServerConfig config, GameDatabaseContext database, GameUser user, int playlistId)
+    {
+        if (user.IsWriteBlocked(config))
+            return Unauthorized;
+        
+        string? slotType = context.QueryString["slot_type"];
+        if (slotType == null)
+            return BadRequest;
+        
+        if (!int.TryParse(context.QueryString["slot_id"], out int slotId))
+            return BadRequest;
+
+        GamePlaylist? parentPlaylist = database.GetPlaylistById(playlistId);
+        if (parentPlaylist == null)
+            return NotFound;
+
+        // Dont let people add slots to other's playlists
+        if (parentPlaylist.PublisherId != user.UserId)
+            return Unauthorized;
+
+        // Adding a playlist to a playlist requires a special case, since we use `SubPlaylistRelation` internally to record child playlists.
+        if (slotType == "playlist")
+        {
+            GamePlaylist? childPlaylist = database.GetPlaylistById(slotId);
+
+            // If the child doesn't exist, exit gracefully
+            if (childPlaylist == null)
+                return NotFound;
+
+            // Dont allow a playlist to be a child of itself
+            if (childPlaylist.PlaylistId == parentPlaylist.PlaylistId)
+                return BadRequest;
+
+            // Add the child playlist to the parent before checking for recursive playlists below to catch cases where a loop would
+            // only happen once the child playlist is added to its new parent
+            database.AddPlaylistToPlaylist(childPlaylist, parentPlaylist);
+
+            // If the parent contains the child in its parent tree, block the request to prevent recursive playlists
+            bool recursive = false;
+            IEnumerable<GamePlaylist> traversedPlaylists = [childPlaylist];
+            parentPlaylist.TraverseParentsRecursively(database, delegate(GamePlaylist playlist)
+            {
+                // If we have already traversed this playlist before, we have found a loop. Stop traversing in that case.
+                if (traversedPlaylists.Contains(playlist))
+                {
+                    recursive = true;
+                    return false;
+                }
+                else
+                {
+                    // Remember this playlist for loop detection
+                    traversedPlaylists = traversedPlaylists.Append(playlist);
+                    return true;
+                }
+            });
+            if (recursive) {
+                // If adding this playlist to its parent has caused a loop which was not there before, remove it from its parent
+                database.RemovePlaylistFromPlaylist(childPlaylist, parentPlaylist);
+                return BadRequest;
+            }
+            
+            // ReSharper disable once ExtractCommonBranchingCode see like 3 lines below (line count subject to change)
+            return OK;
+        }
+        // ReSharper disable once RedundantIfElseBlock i am intentionally writing this code like this to prevent code
+        //                                             accidentally falling outside of the branch during a possible future
+        //                                             refactor and returning OK when not intended. ok, rider? 
+        else
+        {
+            GameLevel? level = database.GetLevelByIdAndType(slotType, slotId);
+            if (level == null)
+                return NotFound;
+ 
+            database.AddLevelToPlaylist(level, parentPlaylist);
+            return OK;
+        }
+    }
+
+    [GameEndpoint("removeFromPlaylist/{playlistId}", HttpMethods.Post)]
+    [RequireEmailVerified]
+    [RateLimitSettings(PlaylistModificationEndpointLimits.TimeoutDuration, PlaylistModificationEndpointLimits.RequestAmount, 
+                            PlaylistModificationEndpointLimits.BlockDuration, PlaylistModificationEndpointLimits.RequestBucket)]
+    public Response RemoveSlotFromPlaylist(RequestContext context, GameServerConfig config, GameDatabaseContext database, GameUser user,
+        int playlistId)
+    {
+        if (user.IsWriteBlocked(config))
+            return Unauthorized;
+        
+        string? slotType = context.QueryString["slot_type"];
+        if (slotType == null)
+            return BadRequest;
+        
+        if (!int.TryParse(context.QueryString["slot_id"], out int slotId))
+            return BadRequest;
+
+        GamePlaylist? parentPlaylist = database.GetPlaylistById(playlistId);
+        if (parentPlaylist == null)
+            return NotFound;
+
+        // Dont let people remove slots from other's playlists
+        if (parentPlaylist.PublisherId != user.UserId)
+            return Unauthorized;
+
+        // Removing a playlist from a playlist requires a special case, since we use `SubPlaylistRelation` internally to record child playlists.
+        if (slotType == "playlist")
+        {
+            GamePlaylist? childPlaylist = database.GetPlaylistById(slotId);
+            if (childPlaylist == null)
+                return NotFound;
+            
+
+            database.RemovePlaylistFromPlaylist(childPlaylist, parentPlaylist);
+
+            // ReSharper disable once ExtractCommonBranchingCode see like 3 lines below (line count subject to change)
+            return OK;
+        }
+        // ReSharper disable once RedundantIfElseBlock i am intentionally writing this code like this to prevent code
+        //                                             accidentally falling outside of the branch during a possible future
+        //                                             refactor and returning OK when not intended. ok, rider? 
+        else
+        {
+            GameLevel? level = database.GetLevelByIdAndType(slotType, slotId);
+            if (level == null)
+                return NotFound;
+
+            database.RemoveLevelFromPlaylist(level, parentPlaylist);
+            
+            return OK;
+        }
+    }
+
+    [GameEndpoint("moveFromPlaylist/{from}", HttpMethods.Post, ContentType.Xml)]
+    [RequireEmailVerified]
+    [RateLimitSettings(PlaylistModificationEndpointLimits.TimeoutDuration, PlaylistModificationEndpointLimits.RequestAmount, 
+                            PlaylistModificationEndpointLimits.BlockDuration, PlaylistModificationEndpointLimits.RequestBucket)]
+    public Response MoveSlotFromPlaylist(RequestContext context, GameServerConfig config, GameDatabaseContext database, GameUser user, int from)     
+    {
+        if (user.IsWriteBlocked(config))
+            return Unauthorized;
+
+        if (!int.TryParse(context.QueryString["to"], out int to))
+            return BadRequest;
+
+        Response ret;
+        
+        if ((ret = this.RemoveSlotFromPlaylist(context, config, database, user, from)).StatusCode != OK)
+            return ret;
+        
+        if ((ret = this.AddSlotToPlaylist(context, config, database, user, to)).StatusCode != OK)
+            return ret;
+
+        return OK;
+    }
+}

@@ -1,0 +1,4 @@
+root = true
+
+is_global = true
+realm.ignore_objects_nullability = true

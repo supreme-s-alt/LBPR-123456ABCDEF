@@ -1,0 +1,129 @@
+using AttribDoc.Attributes;
+using Bunkum.Core;
+using Bunkum.Core.Endpoints;
+using Bunkum.Core.RateLimit;
+using Bunkum.Core.Responses;
+using Bunkum.Core.Storage;
+using Bunkum.Listener.Protocol;
+using Bunkum.Protocols.Http;
+using Refresh.Common.Constants;
+using Refresh.Core.Authentication.Permission;
+using Refresh.Core.Configuration;
+using Refresh.Core.RateLimits.Relations;
+using Refresh.Core.RateLimits.Users;
+using Refresh.Core.Services;
+using Refresh.Core.Types.Data;
+using Refresh.Database;
+using Refresh.Database.Models.Authentication;
+using Refresh.Database.Models.Pins;
+using Refresh.Database.Models.Users;
+using Refresh.Interfaces.APIv3.Documentation.Attributes;
+using Refresh.Interfaces.APIv3.Documentation.Descriptions;
+using Refresh.Interfaces.APIv3.Endpoints.ApiTypes;
+using Refresh.Interfaces.APIv3.Endpoints.ApiTypes.Errors;
+using Refresh.Interfaces.APIv3.Endpoints.DataTypes.Request;
+using Refresh.Interfaces.APIv3.Endpoints.DataTypes.Response.Users;
+using Refresh.Interfaces.APIv3.Extensions;
+
+namespace Refresh.Interfaces.APIv3.Endpoints;
+
+public class UserApiEndpoints : EndpointGroup
+{
+    [ApiV3Endpoint("users/{idType}/{id}"), Authentication(false)]
+    [DocSummary("Tries to find a user by name or UUID")]
+    [DocError(typeof(ApiNotFoundError), "The user cannot be found")]
+    [RateLimitSettings(SingleUserEndpointLimits.TimeoutDuration, SingleUserEndpointLimits.ApiRequestAmount, 
+                            SingleUserEndpointLimits.BlockDuration, SingleUserEndpointLimits.ApiRequestBucket)]
+    public ApiResponse<ApiGameUserResponse> GetUser(RequestContext context, GameDatabaseContext database,
+        [DocSummary(SharedParamDescriptions.UserIdParam)] string id, 
+        [DocSummary(SharedParamDescriptions.UserIdTypeParam)] string idType, DataContext dataContext)
+    {
+        GameUser? user = database.GetUserByIdAndType(idType, id);
+        if(user == null) return ApiNotFoundError.UserMissingError;
+        
+        return ApiGameUserResponse.FromOld(user, dataContext);
+    }
+
+    [ApiV3Endpoint("users/{idType}/{id}/heart", HttpMethods.Post)]
+    [DocSummary("Hearts a user by their name or UUID")]
+    [DocError(typeof(ApiNotFoundError), ApiNotFoundError.UserMissingErrorWhen)]
+    [RateLimitSettings(CommonRelationEndpointLimits.TimeoutDuration, CommonRelationEndpointLimits.RequestAmount, 
+                            CommonRelationEndpointLimits.BlockDuration, CommonRelationEndpointLimits.RequestBucket)]
+    public ApiOkResponse HeartUser(RequestContext context, GameDatabaseContext database,
+        [DocSummary(SharedParamDescriptions.UserIdParam)] string id, 
+        [DocSummary(SharedParamDescriptions.UserIdTypeParam)] string idType, DataContext dataContext, GameUser user, GameServerConfig config)
+    {
+        if (user.IsWriteBlocked(config)) 
+            return ApiAuthenticationError.ReadOnlyError;
+
+        GameUser? target = database.GetUserByIdAndType(idType, id);
+        if(target == null) return ApiNotFoundError.UserMissingError;
+        
+        bool success = database.FavouriteUser(target, user);
+
+        // Only give pin if the user was hearted without having already been hearted.
+        // Won't protect against spam, but this way the pin objective is more accurately implemented.
+        if (success)
+            database.IncrementUserPinProgress((long)ServerPins.HeartPlayerOnWebsite, 1, user, false, TokenPlatform.Website);
+
+        return new ApiOkResponse();
+    }
+
+    [ApiV3Endpoint("users/{idType}/{id}/unheart", HttpMethods.Post)]
+    [DocSummary("Unhearts a user by their name or UUID")]
+    [DocError(typeof(ApiNotFoundError), ApiNotFoundError.UserMissingErrorWhen)]
+    [RateLimitSettings(CommonRelationEndpointLimits.TimeoutDuration, CommonRelationEndpointLimits.RequestAmount, 
+                            CommonRelationEndpointLimits.BlockDuration, CommonRelationEndpointLimits.RequestBucket)]
+    public ApiOkResponse UnheartUser(RequestContext context, GameDatabaseContext database,
+        [DocSummary(SharedParamDescriptions.UserIdParam)] string id, 
+        [DocSummary(SharedParamDescriptions.UserIdTypeParam)] string idType, DataContext dataContext, GameUser user, GameServerConfig config)
+    {
+        if (user.IsWriteBlocked(config)) 
+            return ApiAuthenticationError.ReadOnlyError;
+
+        GameUser? target = database.GetUserByIdAndType(idType, id);
+        if(target == null) return ApiNotFoundError.UserMissingError;
+        
+        database.UnfavouriteUser(target, user);
+        return new ApiOkResponse();
+    }
+    
+    [ApiV3Endpoint("users/me"), MinimumRole(GameUserRole.Restricted)]
+    [DocSummary("Returns your own user, provided you are authenticated")]
+    [DocError(typeof(ApiAuthenticationError), "You are not authenticated")]
+    [RateLimitSettings(120, 35, 80, "me-api")]
+    public ApiResponse<ApiExtendedGameUserResponse> GetMyUser(RequestContext context, GameUser? user,
+        GameDatabaseContext database, IDataStore dataStore, DataContext dataContext)
+    {
+        if (user == null) return ApiAuthenticationError.NotAuthenticated;
+        return ApiExtendedGameUserResponse.FromOld(user, dataContext);
+    }
+    
+    [ApiV3Endpoint("users/me", HttpMethods.Patch)]
+    [DocSummary("Updates your profile with the given data")]
+    [RateLimitSettings(UserModificationEndpointLimits.TimeoutDuration, UserModificationEndpointLimits.ApiRequestAmount, 
+                            UserModificationEndpointLimits.BlockDuration, UserModificationEndpointLimits.ApiRequestBucket)]
+    public ApiResponse<ApiExtendedGameUserResponse> UpdateUser(RequestContext context, GameDatabaseContext database,
+        GameUser user, ApiUpdateUserRequest body, IDataStore dataStore, DataContext dataContext, IntegrationConfig integrationConfig,
+        SmtpService smtpService)
+    {
+        (body.IconHash, ApiError? mainIconError) = body.IconHash.ValidateIcon(dataContext);
+        if (mainIconError != null) return mainIconError;
+
+        (body.VitaIconHash, ApiError? vitaIconError) = body.VitaIconHash.ValidateIcon(dataContext);
+        if (vitaIconError != null) return vitaIconError;
+
+        (body.BetaIconHash, ApiError? betaIconError) = body.BetaIconHash.ValidateIcon(dataContext);
+        if (betaIconError != null) return betaIconError;
+
+        if (body.EmailAddress != null && !smtpService.CheckEmailDomainValidity(body.EmailAddress))
+            return ApiValidationError.EmailDoesNotActuallyExistError;
+        
+        // Trim description
+        if (body.Description != null && body.Description.Length > UgcLimits.DescriptionLimit)
+            body.Description = body.Description[..UgcLimits.DescriptionLimit];
+
+        database.UpdateUserData(user, body);
+        return ApiExtendedGameUserResponse.FromOld(user, dataContext);
+    }
+}

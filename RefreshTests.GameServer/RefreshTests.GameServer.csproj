@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        
+        <IsTestProject>true</IsTestProject>
+        <Configurations>Debug;Release;DebugLocalBunkum</Configurations>
+        <Platforms>AnyCPU</Platforms>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <WarningsNotAsErrors>612,618</WarningsNotAsErrors>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+        <PackageReference Include="NUnit" Version="4.4.0" />
+        <PackageReference Include="NUnit3TestAdapter" Version="5.2.0" />
+        <PackageReference Include="NUnit.Analyzers" Version="4.11.2">
+          <PrivateAssets>all</PrivateAssets>
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="coverlet.collector" Version="8.0.0">
+          <PrivateAssets>all</PrivateAssets>
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="Testcontainers.PostgreSql" Version="4.8.1" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\Refresh.GameServer\Refresh.GameServer.csproj" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(Configuration)'=='DebugLocalBunkum'">
+        <Reference Include="Bunkum.Core">
+            <HintPath>..\..\Bunkum\Bunkum.Core\bin\Debug\net8.0\Bunkum.Core.dll</HintPath>
+        </Reference>
+        <Reference Include="Bunkum.Listener">
+            <HintPath>..\..\Bunkum\Bunkum.Listener\bin\Debug\net8.0\Bunkum.Listener.dll</HintPath>
+        </Reference>
+        <Reference Include="Bunkum.Protocols.Http">
+            <HintPath>..\..\Bunkum\Bunkum.Protocols.Http\bin\Debug\net8.0\Bunkum.Protocols.Http.dll</HintPath>
+        </Reference>
+        <Reference Include="Bunkum.RealmDatabase">
+            <HintPath>..\..\Bunkum\Bunkum.RealmDatabase\bin\Debug\net8.0\Bunkum.RealmDatabase.dll</HintPath>
+        </Reference>
+        <Reference Include="Bunkum.AutoDiscover">
+            <HintPath>..\..\Bunkum\Bunkum.AutoDiscover\bin\Debug\net8.0\Bunkum.AutoDiscover.dll</HintPath>
+        </Reference>
+
+        <!-- Package references must match Bunkum.HttpServer's csproj -->
+        <PackageReference Include="JetBrains.Annotations" Version="2024.3.0" />
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+        <PackageReference Include="NotEnoughLogs" Version="2.0.3" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <EmbeddedResource Include="Resources\1x1.png" />
+    </ItemGroup>
+
+</Project>

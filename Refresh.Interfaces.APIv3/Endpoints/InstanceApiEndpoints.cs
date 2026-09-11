@@ -1,0 +1,102 @@
+using AttribDoc.Attributes;
+using Bunkum.Core;
+using Bunkum.Core.Endpoints;
+using Bunkum.Core.RateLimit;
+using Refresh.Core;
+using Refresh.Core.Authentication.Permission;
+using Refresh.Core.Configuration;
+using Refresh.Core.Services;
+using Refresh.Core.Types.Data;
+using Refresh.Core.Types.Matching;
+using Refresh.Core.Types.RichPresence;
+using Refresh.Database;
+using Refresh.Interfaces.APIv3.Endpoints.ApiTypes;
+using Refresh.Interfaces.APIv3.Endpoints.DataTypes.Response;
+
+namespace Refresh.Interfaces.APIv3.Endpoints;
+
+public class InstanceApiEndpoints : EndpointGroup
+{
+    [ApiV3Endpoint("statistics"), Authentication(false)]
+    [DocSummary("Retrieves various statistics about the Refresh instance.")]
+    [RateLimitSettings(300, 12, 240, "instance-stats-api")]
+    public ApiResponse<ApiStatisticsResponse> GetStatistics(RequestContext context, GameDatabaseContext database,
+        MatchService match, GameServerConfig config, DataContext dataContext)
+    {
+        ApiRequestStatisticsResponse requestStatistics = ApiRequestStatisticsResponse.FromOld(database.GetRequestStatistics(), dataContext)!;
+
+        RoomStatistics statistics = match.RoomAccessor.GetStatistics();
+        
+        return new ApiStatisticsResponse
+        {
+            TotalLevels = database.GetTotalLevelCount(),
+            ModdedLevels = database.GetModdedLevelCount(),
+            TotalUsers = database.GetTotalUserCount(),
+            ActiveUsers = database.GetActiveUserCount(),
+            TotalPhotos = database.GetTotalPhotoCount(),
+            TotalEvents = database.GetTotalEventCount(),
+            CurrentRoomCount = statistics.RoomCount,
+            CurrentIngamePlayersCount = statistics.PlayerCount,
+            RequestStatistics = requestStatistics,
+        };
+    }
+
+    [ApiV3Endpoint("announcements"), Authentication(false), AllowDuringMaintenance]
+    [DocSummary("Retrieves all current announcements.")]
+    [RateLimitSettings(300, 60, 240, "announcements-api")]
+    public ApiResponse<List<ApiGameAnnouncementResponse>> GetAllAnnouncements(RequestContext context, DataContext dataContext) 
+        => ApiGameAnnouncementResponse.FromOldList(dataContext.Database.GetAnnouncements().ToArray(), dataContext).ToList();
+
+    [ApiV3Endpoint("instance"), Authentication(false), AllowDuringMaintenance]
+    [ClientCacheResponse(3600)] // One hour
+    [DocSummary("Retrieves various information and metadata about the Refresh instance.")]
+    [RateLimitSettings(300, 12, 240, "instance-info-api")]
+    public ApiResponse<ApiInstanceResponse> GetInstanceInformation(RequestContext context,
+        GameServerConfig gameConfig,
+        RichPresenceConfig richConfig,
+        IntegrationConfig integrationConfig,
+        ContactInfoConfig contactInfoConfig,
+        GameDatabaseContext database,
+        DataContext dataContext) 
+        => new ApiInstanceResponse
+        {
+            InstanceName = gameConfig.InstanceName,
+            InstanceDescription = gameConfig.InstanceDescription,
+            RegistrationEnabled = gameConfig.RegistrationEnabled,
+            SoftwareName = "Refresh",
+            SoftwareVersion = VersionInformation.Version,
+            SoftwareSourceUrl = "https://github.com/LittleBigRefresh/Refresh",
+            SoftwareLicenseName = "AGPL-3.0",
+            SoftwareLicenseUrl = "https://www.gnu.org/licenses/agpl-3.0.txt",
+            BlockedAssetFlags = gameConfig.NormalUserPermissions.BlockedAssetFlags,
+            BlockedAssetFlagsForTrustedUsers = gameConfig.TrustedUserPermissions.BlockedAssetFlags,
+            Announcements = ApiGameAnnouncementResponse.FromOldList(database.GetAnnouncements(), dataContext),
+            MaintenanceModeEnabled = gameConfig.MaintenanceMode,
+            RichPresenceConfiguration = ApiRichPresenceConfigurationResponse.FromOld(RichPresenceConfiguration.Create(
+                gameConfig,
+                richConfig), dataContext)!,
+            GrafanaDashboardUrl = integrationConfig.GrafanaDashboardUrl,
+            WebsiteLogoUrl = integrationConfig.WebsiteLogoUrl,
+            WebsiteDefaultTheme = integrationConfig.WebsiteDefaultTheme,
+            IsPresenceServerEnabled = integrationConfig.PresenceEnabled,
+            ServerStatusUrl = integrationConfig.ServerStatusUrl,
+
+            NormalUserPermissions = ApiRolePermissionsResponse.FromOld(gameConfig.NormalUserPermissions),
+            TrustedUserPermissions = ApiRolePermissionsResponse.FromOld(gameConfig.TrustedUserPermissions),
+            
+            ContactInfo = new ApiContactInfoResponse
+            {
+                AdminName = contactInfoConfig.AdminName,
+                EmailAddress = contactInfoConfig.EmailAddress,
+                DiscordServerInvite = contactInfoConfig.DiscordServerInvite,
+                AdminDiscordUsername = contactInfoConfig.AdminDiscordUsername,
+            },
+            
+            ActiveContest = ApiContestResponse.FromOld(database.GetNewestActiveContest(), dataContext),
+#if DEBUG
+            SoftwareType = "Debug",
+#else
+            SoftwareType = "Release",
+#endif
+        };
+}

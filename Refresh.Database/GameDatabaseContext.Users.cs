@@ -1,0 +1,718 @@
+using JetBrains.Annotations;
+using MongoDB.Bson;
+using Refresh.Common.Constants;
+using Refresh.Database.Query;
+using Refresh.Database.Models.Authentication;
+using Refresh.Database.Models.Users;
+using Refresh.Database.Models.Levels.Challenges;
+using Refresh.Database.Models.Levels.Scores;
+using Refresh.Database.Models.Levels;
+using Refresh.Database.Models.Photos;
+using Refresh.Database.Models.Assets;
+using System.Diagnostics;
+using Refresh.Database.Models;
+
+namespace Refresh.Database;
+
+public partial class GameDatabaseContext // Users
+{
+    private IQueryable<GameUser> GameUsersIncluded => this.GameUsers
+        .Include(u => u.Statistics);
+    
+    private IQueryable<PreviousUsername> PreviousUsernamesIncluded => this.PreviousUsernames
+        .Include(u => u.User)
+        .Include(u => u.User.Statistics);
+    
+    [Pure]
+    [ContractAnnotation("username:null => null; username:notnull => canbenull")]
+    public GameUser? GetUserByUsername(string? username, bool caseSensitive = true)
+    {
+        if (string.IsNullOrWhiteSpace(username)) 
+            return null;
+        
+        // Try the first pass to get the user
+        GameUser? user = caseSensitive
+            ? this.GameUsersIncluded.FirstOrDefault(u => u.Username == username)
+            : this.GameUsersIncluded.FirstOrDefault(u => u.UsernameLower == username.ToLower());
+        
+        // If that failed and the username is the deleted user, then we need to create the backing deleted user
+        if (username == SystemUsers.DeletedUserName && user == null)
+        {
+            this.Write(() =>
+            {
+                this.GameUsers.Add(user = new GameUser
+                {
+                    Username = SystemUsers.DeletedUserName,
+                    Description = SystemUsers.DeletedUserDescription,
+                    FakeUser = true,
+                });
+            });
+        } 
+        // If that failed and the username is a fake re-upload user, then we need to create the backing fake user
+        else if (username.StartsWith(SystemUsers.SystemPrefix) && user == null)
+        {
+            this.Write(() =>
+            {
+                this.GameUsers.Add(user = new GameUser
+                {
+                    Username = username,
+                    Description = SystemUsers.UnknownUserDescription,
+                    FakeUser = true,
+                });
+            });
+        }
+        
+        return user;
+    }
+    
+    [Pure]
+    [ContractAnnotation("null => null; notnull => canbenull")]
+    public GameUser? GetUserByEmailAddress(string? emailAddress)
+    {
+        if (emailAddress == null) return null;
+
+        emailAddress = emailAddress.ToLowerInvariant();
+        GameUser? user = this.GameUsersIncluded.FirstOrDefault(u => u.EmailAddress == emailAddress);
+        if (user == null) return null;
+
+        if (user.EmailAddress != emailAddress)
+        {
+#if DEBUG
+            if(Debugger.IsAttached) Debugger.Break();
+#endif
+            throw new InvalidDataException($"GetUserByEmailAddress - Found user's email does not match given email!");
+        }
+
+        return user;
+    }
+
+    [Pure]
+    [ContractAnnotation("null => null; notnull => canbenull")]
+    public GameUser? GetUserByObjectId(ObjectId? id)
+    {
+        if (id == null) return null;
+        return this.GameUsersIncluded.FirstOrDefault(u => u.UserId == id);
+    }
+    
+    [Pure]
+    [ContractAnnotation("null => null; notnull => canbenull")]
+    public GameUser? GetUserByUuid(string? uuid)
+    {
+        if (uuid == null) return null;
+        if(!ObjectId.TryParse(uuid, out ObjectId objectId)) return null;
+        return this.GameUsersIncluded.FirstOrDefault(u => u.UserId == objectId);
+    }
+
+    public GameUser? GetUserByIdAndType(string idType, string id)
+    {
+        switch (idType.ToLower())
+        {
+            case "username":
+            case "name":
+                return this.GetUserByUsername(id, false);
+            case "uuid":
+                return this.GetUserByUuid(id);
+            default:
+                return null;
+        }
+    }
+
+    public DatabaseList<GameUser> GetUsers(int count, int skip)
+        => new(this.GameUsersIncluded.OrderByDescending(u => u.JoinDate), skip, count);
+    
+    public DatabaseList<GameUser> GetMostFavouritedUsers(int skip, int count)
+        => new(this.GameUsersIncluded
+            .Where(u => u.Statistics!.FavouriteCount > 0)
+            .OrderByDescending(u => u.Statistics!.FavouriteCount), skip, count);
+
+    public DatabaseList<PreviousUsername> GetPreviousUsernameRecordsByName(string username, int skip, int count)
+    {
+        return new(this.PreviousUsernamesIncluded
+            .Where(u => u.Username == username)
+            .OrderByDescending(u => u.ReplacedAt), skip, count);
+    }
+    
+    public DatabaseList<PreviousUsername> GetPreviousUsernameRecordsByUser(GameUser user, int skip, int count)
+    {
+        return new(this.PreviousUsernamesIncluded
+            .Where(u => u.UserId == user.UserId)
+            .OrderByDescending(u => u.ReplacedAt), skip, count);
+    }
+
+    public void UpdateUserData(GameUser user, ISerializedEditUser data, TokenGame game)
+    {
+        this.Write(() =>
+        {
+            if (data.Description != null)
+                user.Description = data.Description;
+
+            if (data.UserLocation != null)
+            {
+                user.LocationX = data.UserLocation.X;
+                user.LocationY = data.UserLocation.Y;
+            }
+
+            if (data.PlanetsHash != null)
+                // ReSharper disable once SwitchStatementMissingSomeEnumCasesNoDefault
+                switch (game)
+                {
+                    case TokenGame.LittleBigPlanet2:
+                        user.Lbp2PlanetsHash = data.PlanetsHash;
+                        user.AreLbp2PlanetsModded = this.GetPlanetModdedStatus(data.PlanetsHash);
+                        break;
+                    case TokenGame.LittleBigPlanet3:
+                        user.Lbp3PlanetsHash = data.PlanetsHash;
+                        user.AreLbp3PlanetsModded = this.GetPlanetModdedStatus(data.PlanetsHash);
+                        break;
+                    case TokenGame.LittleBigPlanetVita:
+                        user.VitaPlanetsHash = data.PlanetsHash;
+                        user.AreVitaPlanetsModded = this.GetPlanetModdedStatus(data.PlanetsHash);
+                        break;
+                    case TokenGame.BetaBuild:
+                        user.BetaPlanetsHash = data.PlanetsHash;
+                        user.AreBetaPlanetsModded = this.GetPlanetModdedStatus(data.PlanetsHash);
+                        break;
+                }
+
+            // ReSharper disable once InvertIf
+            if (data.IconHash != null)
+                switch (game)
+                {
+                    case TokenGame.LittleBigPlanet1:
+                    case TokenGame.LittleBigPlanet2:
+                    case TokenGame.LittleBigPlanet3:
+#if false // TODO: Enable this code once https://github.com/LittleBigRefresh/Refresh/issues/309 is resolved
+                        //If the icon is a remote asset, then it will work on Vita as well, so set the Vita hash 
+                        if (!data.IconHash.StartsWith('g'))
+                        {
+                            user.VitaIconHash = data.IconHash;
+                        }
+#endif
+                        user.IconHash = data.IconHash;
+                        break;
+                    case TokenGame.LittleBigPlanetVita:
+#if false // TODO: Enable this code once https://github.com/LittleBigRefresh/Refresh/issues/309 is resolved
+                        //If the icon is a remote asset, then it will work on PS3 as well, so set the PS3 hash to it as well
+                        if (!data.IconHash.StartsWith('g'))
+                        {
+                            user.IconHash = data.IconHash;
+                        }
+#endif
+                        user.VitaIconHash = data.IconHash;
+                        
+                        break;
+                    case TokenGame.LittleBigPlanetPSP:
+                        //PSP icons are special and use a GUID system separate from the mainline games,
+                        //so we separate PSP icons to another field
+                        user.PspIconHash = data.IconHash;
+                        break;
+                    case TokenGame.BetaBuild:
+                        user.BetaIconHash = data.IconHash;
+                        break;
+                }
+            
+            if (data.YayFaceHash != null)
+                user.YayFaceHash = data.YayFaceHash;
+            if (data.BooFaceHash != null)
+                user.BooFaceHash = data.BooFaceHash;
+            if (data.MehFaceHash != null)
+                user.MehFaceHash = data.MehFaceHash;
+        });
+    }
+    
+    public void UpdateUserData(GameUser user, IApiEditUserRequest data)
+    {
+        this.Write(() =>
+        {
+            if (data.EmailAddress != null && data.EmailAddress != user.EmailAddress)
+            {
+                user.EmailAddressVerified = false;
+            }
+
+            data.EmailAddress = data.EmailAddress?.ToLowerInvariant();
+
+            if (data.IconHash != null)
+                user.IconHash = data.IconHash;
+            
+            if (data.VitaIconHash != null)
+                user.VitaIconHash = data.VitaIconHash;
+            
+            if (data.BetaIconHash != null)
+                user.BetaIconHash = data.BetaIconHash;
+
+            if (data.Description != null)
+                user.Description = data.Description;
+
+            if (data.AllowIpAuthentication != null)
+                user.AllowIpAuthentication = data.AllowIpAuthentication.Value;
+
+            if (data.PsnAuthenticationAllowed != null)
+                user.PsnAuthenticationAllowed = data.PsnAuthenticationAllowed.Value;
+
+            if (data.RpcnAuthenticationAllowed != null)
+                user.RpcnAuthenticationAllowed = data.RpcnAuthenticationAllowed.Value;
+            
+            if (data.UnescapeXmlSequences != null)
+                user.UnescapeXmlSequences = data.UnescapeXmlSequences.Value;
+
+            if (data.EmailAddress != null)
+                user.EmailAddress = data.EmailAddress;
+            
+            if (data.LevelVisibility != null)
+                user.LevelVisibility = data.LevelVisibility.Value;
+            
+            if (data.ProfileVisibility != null)
+                user.ProfileVisibility = data.ProfileVisibility.Value;
+            
+            if (data.ShowModdedPlanets != null)
+                user.ShowModdedPlanets = data.ShowModdedPlanets.Value;
+
+            if (data.ShowModdedContent != null)
+                user.ShowModdedContent = data.ShowModdedContent.Value;
+            
+            if (data.ShowReuploadedContent != null)
+                user.ShowReuploadedContent = data.ShowReuploadedContent.Value;
+            
+            if (data.RedirectGriefReportsToPhotos != null)
+                user.RedirectGriefReportsToPhotos = data.RedirectGriefReportsToPhotos.Value;
+        });
+    }
+
+    public void UpdateUserData(GameUser user, IApiAdminEditUserRequest data)
+    {
+        if (data.IconHash != null)
+            user.IconHash = data.IconHash;
+            
+        if (data.VitaIconHash != null)
+            user.VitaIconHash = data.VitaIconHash;
+        
+        if (data.BetaIconHash != null)
+            user.BetaIconHash = data.BetaIconHash;
+
+        if (data.Description != null)
+            user.Description = data.Description;
+        
+        if (data.Role != null)
+            user.Role = data.Role.Value;
+        
+        this.GameUsers.Update(user);
+        this.SaveChanges();
+    }
+
+    public void UpdatePlanetModdedStatus(GameUser user)
+    {
+        user.AreLbp2PlanetsModded = this.GetPlanetModdedStatus(user.Lbp2PlanetsHash);
+        user.AreLbp3PlanetsModded = this.GetPlanetModdedStatus(user.Lbp3PlanetsHash);
+        user.AreVitaPlanetsModded = this.GetPlanetModdedStatus(user.VitaPlanetsHash);
+        user.AreBetaPlanetsModded = this.GetPlanetModdedStatus(user.BetaPlanetsHash);
+    }
+
+    private bool GetPlanetModdedStatus(string rootAssetHash)
+    {
+        bool modded = false;
+
+        GameAsset? rootAsset = this.GetAssetFromHash(rootAssetHash);
+        rootAsset?.TraverseDependenciesRecursively(this, (_, asset) =>
+        {
+            if (asset != null && (asset.AssetFlags & (AssetFlags.Modded | AssetFlags.ModdedOnPlanets)) != 0)
+                modded = true;
+        });
+        
+        return modded;
+    }
+
+    [Pure]
+    public int GetTotalUserCount() => this.GameUsers.Count();
+    
+    [Pure]
+    public int GetActiveUserCount()
+    {
+        DateTimeOffset timeFrame = this._time.Now.Subtract(TimeSpan.FromDays(7));
+        return this.GameUsers.Count(u => u.LastLoginDate > timeFrame);
+    }
+
+    public void SetUserRole(GameUser user, GameUserRole role)
+    {
+        if(role == GameUserRole.Banned) throw new InvalidOperationException($"Cannot ban a user with this method. Please use {nameof(this.BanUser)}().");
+        
+        if (user.Role is GameUserRole.Banned or GameUserRole.Restricted)
+        {
+            user.BanReason = null;
+            user.BanExpiryDate = null;
+        };
+        
+        user.Role = role;
+        this.GameUsers.Update(user);
+        this.SaveChanges();
+    }
+
+    private void PunishUser(GameUser user, string reason, DateTimeOffset expiryDate, GameUserRole role)
+    {
+        this.Write(() =>
+        {
+            user.Role = role;
+            user.BanReason = reason;
+            user.BanExpiryDate = expiryDate;
+        });
+    }
+
+    public void BanUser(GameUser user, string reason, DateTimeOffset expiryDate)
+    {
+        this.PunishUser(user, reason, expiryDate, GameUserRole.Banned);
+        this.RevokeAllTokensForUser(user);
+    }
+
+    public void RestrictUser(GameUser user, string reason, DateTimeOffset expiryDate) 
+        => this.PunishUser(user, reason, expiryDate, GameUserRole.Restricted);
+
+    private bool IsUserPunished(GameUser user, GameUserRole role)
+    {
+        if (user.Role != role) return false;
+        if (user.BanExpiryDate == null) return false;
+        
+        return user.BanExpiryDate >= this._time.Now;
+    }
+
+    public bool IsUserBanned(GameUser user) => this.IsUserPunished(user, GameUserRole.Banned);
+    public bool IsUserRestricted(GameUser user) => this.IsUserPunished(user, GameUserRole.Restricted);
+
+    public DatabaseList<GameUser> GetAllUsersWithRole(GameUserRole role)
+        => new(this.GameUsersIncluded.Where(u => u.Role == role));
+
+    public void RenameUser(GameUser user, string newUsername, bool force = false)
+    {
+        if (!force)
+        {
+            if (!newUsername.StartsWith(SystemUsers.SystemPrefix) && !this.IsUsernameValid(newUsername))
+            {
+                throw new ArgumentException("Username is invalid!", nameof(newUsername));
+            }
+
+            if (this.IsUsernameTaken(newUsername))
+            {
+                throw new ArgumentException("Username is already taken!", nameof(newUsername));
+            }
+        }
+
+        string oldUsername = user.Username;
+        user.Username = newUsername;
+
+        this.PreviousUsernames.Add(new()
+        {
+            Username = oldUsername,
+            User = user,
+            ReplacedAt = this._time.Now,
+        });
+
+        // Postgres/EF will try to insert untracked entities by default, which will fail if such entities already exist in DB.
+        // We can't guarantee that both user and its referenced entities (currently just statistics cache) are tracked here,
+        // so we should explicitly update user and explicitly track statistics as unchanged to avoid random inconsistent failures.
+        // TODO do explicitly track referenced entities in other similar DB modification methods as well, to also avoid occasional insertion there.
+        this.GameUsers.Update(user);
+        if (user.Statistics != null)
+            this.GameUserStatistics.Attach(user.Statistics);
+
+        this.SaveChanges();
+        
+        this.AddNotification("Username Updated", $"An admin has updated your account's username from '{oldUsername}' to '{newUsername}'. " +
+                                                 $"If there are any problems caused by this, please let us know.", user);
+        
+        // Since ticket authentication is username-based, delete all game tokens for this user
+        // Future authentication is going to be invalid, and the client is going to be in a broken state anyways.
+        this.RevokeAllTokensForUser(user, TokenType.Game);
+    }
+
+    public void DeleteUser(GameUser user)
+    {
+        const string deletedReason = "This user's account has been deleted.";
+        
+        this.BanUser(user, deletedReason, DateTimeOffset.MaxValue);
+        this.RevokeAllTokensForUser(user);
+        this.DeleteNotificationsByUser(user);
+        
+        this.Write(() =>
+        {
+            user.LocationX = 0;
+            user.LocationY = 0;
+            user.Description = deletedReason;
+            user.EmailAddress = null;
+            user.PasswordBcrypt = "deleted";
+            user.JoinDate = DateTimeOffset.MinValue;
+            user.LastLoginDate = DateTimeOffset.MinValue;
+            user.Lbp2PlanetsHash = "0";
+            user.Lbp3PlanetsHash = "0";
+            user.VitaPlanetsHash = "0";
+            user.BetaPlanetsHash = "0";
+            user.IconHash = "0";
+            user.VitaIconHash = "0";
+            user.BetaIconHash = "0";
+            user.PspIconHash = "0";
+            user.YayFaceHash = "0";
+            user.BooFaceHash = "0";
+            user.MehFaceHash = "0";
+            user.AllowIpAuthentication = false;
+            user.EmailAddressVerified = false;
+            user.PsnAuthenticationAllowed = false;
+            user.RpcnAuthenticationAllowed = false;
+            
+            foreach (GamePhotoSubject subject in this.GamePhotoSubjects.Where(s => s.UserId == user.UserId).ToList())
+            {
+                subject.UserId = null;
+            }
+
+            this.FavouriteLevelRelations.RemoveRange(r => r.UserId == user.UserId);
+            this.FavouriteUserRelations.RemoveRange(r => r.UserToFavouriteId == user.UserId);
+            this.FavouriteUserRelations.RemoveRange(r => r.UserFavouritingId == user.UserId);
+            this.QueueLevelRelations.RemoveRange(r => r.UserId == user.UserId);
+            this.TagLevelRelations.RemoveRange(r => r.UserId == user.UserId);
+            this.GameUserVerifiedIpRelations.RemoveRange(p => p.UserId == user.UserId);
+
+            this.GameNotifications.RemoveRange(s => s.UserId == user.UserId);
+            this.GamePhotos.RemoveRange(p => p.PublisherId == user.UserId);
+            this.Events.RemoveRange(e => e.UserId == user.UserId);
+            this.GameScores.RemoveRange(s => s.PublisherId == user.UserId);
+            this.GameChallengeScores.RemoveRange(s => s.PublisherUserId == user.UserId);
+
+            this.GameLevelComments.RemoveRange(s => s.AuthorUserId == user.UserId);
+            this.LevelCommentRelations.RemoveRange(s => s.UserId == user.UserId);
+            this.GameProfileComments.RemoveRange(s => s.AuthorUserId == user.UserId);
+            this.ProfileCommentRelations.RemoveRange(s => s.UserId == user.UserId);
+            this.GameReviews.RemoveRange(s => s.PublisherUserId == user.UserId);
+            this.RateReviewRelations.RemoveRange(s => s.UserId == user.UserId);
+            
+            this.PinProgressRelations.RemoveRange(s => s.PublisherId == user.UserId);
+            this.ProfilePinRelations.RemoveRange(s => s.PublisherId == user.UserId);
+            this.GamePlaylists.RemoveRange(s => s.PublisherId == user.UserId);
+
+            foreach (GameLevel level in this.GameLevels.Where(l => l.PublisherUserId == user.UserId))
+            {
+                level.Publisher = null;
+            }
+
+            foreach (GameChallenge challenge in this.GameChallenges.Where(c => c.PublisherUserId == user.UserId))
+            {
+                challenge.Publisher = null;
+            }
+        });
+    }
+
+    public void FullyDeleteUser(GameUser user)
+    {
+        // do an initial cleanup of everything before deleting the row  
+        this.DeleteUser(user);
+
+        // Set asset uploader to null to avoid EF throwing when fully deleting the original uploader outside of unit tests.
+        // No cascade-delete because currently, there's no way to delete assets from the data store, because doing so
+        // was ruled to be dangerous due to the risk of accidentally causing in-game issues due to no longer available assets
+        // (this risk is practically minimal, so this ruling is likely to change in the future). 
+        // Also, moderation may be an argument for not cascade-deleting assets.
+        // TODO: Store ID or name of the uploader separately/in a way where it won't be removed when deleting the user.
+        IEnumerable<GameAsset> assets = this.GetAssetsUploadedByUserInternal(user).ToArray();
+        foreach(GameAsset asset in assets)
+        {
+            asset.OriginalUploader = null;
+        }
+        this.UpdateAssetsInDatabase(assets);
+
+        // Same applies to level revisions.
+        // These are not cascade-deleted because GameLevels aren't either; their publisher is set to null and shown as !Deleted.
+        IEnumerable<GameLevelRevision> levelRevisions = this.GetLevelRevisionsByUserInternal(user).ToArray();
+        foreach(GameLevelRevision levelRevision in levelRevisions)
+        {
+            levelRevision.CreatedBy = null;
+        }
+        this.UpdateLevelRevisions(levelRevisions);
+        
+        // Another issue unreproducible in unit tests where we can't just use Remove() on the user object.
+        this.GameUsers.RemoveRange(u => u.UserId == user.UserId);
+        this.SaveChanges();
+    }
+
+    public void ResetUserPlanets(GameUser user)
+    {
+        user.Lbp2PlanetsHash = "0";
+        user.Lbp3PlanetsHash = "0";
+        user.VitaPlanetsHash = "0";
+        user.BetaPlanetsHash = "0";
+        user.AreLbp2PlanetsModded = false;
+        user.AreLbp3PlanetsModded = false;
+        user.AreVitaPlanetsModded = false;
+        user.AreBetaPlanetsModded = false;
+        this.SaveChanges();
+    }
+
+    public void SetUnescapeXmlSequences(GameUser user, bool value)
+    {
+        this.Write(() =>
+        {
+            user.UnescapeXmlSequences = value;
+        });
+    }
+
+    public void SetShowModdedPlanets(GameUser user, bool value)
+    {
+        user.ShowModdedPlanets = value;
+        this.SaveChanges();
+    }
+
+    public void SetShowModdedContent(GameUser user, bool value)
+    {
+        this.Write(() =>
+        {
+            user.ShowModdedContent = value;
+        });
+    }
+    
+    public void SetShowReuploadedContent(GameUser user, bool value)
+    {
+        this.Write(() =>
+        {
+            user.ShowReuploadedContent = value;
+        });
+    }
+    
+    public void SetUserGriefReportRedirection(GameUser user, bool value)
+    {
+        this.Write(() =>
+        {
+            user.RedirectGriefReportsToPhotos = value;
+        });
+    }
+
+    public void ClearForceMatch(GameUser user)
+    {
+        this.Write(() =>
+        {
+            user.ForceMatch = null;
+        });
+    }
+
+    public void SetForceMatch(GameUser user, GameUser target)
+    {
+        this.Write(() =>
+        {
+            user.ForceMatch = target.ForceMatch;
+        });
+    }
+    
+    public void ForceUserTokenGame(Token token, TokenGame game)
+    {
+        this.Write(() =>
+        {
+            token.TokenGame = game;
+        });
+    }
+    
+    public void ForceUserTokenPlatform(Token token, TokenPlatform platform)
+    {
+        this.Write(() =>
+        {
+            token.TokenPlatform = platform;
+        });
+    }
+    
+    public void IncrementUserFilesizeQuota(GameUser user, int amount)
+    {
+        this.Write(() =>
+        {
+            user.FilesizeQuotaUsage += amount;
+        });
+    }
+    
+    public void SetPrivacySettings(GameUser user, IEditUserPrivacySettings settings) 
+    {
+        this.Write(() =>
+        {
+            if(settings.LevelVisibility != null)
+                user.LevelVisibility = settings.LevelVisibility.Value;
+            
+            if (settings.ProfileVisibility != null)
+                user.ProfileVisibility = settings.ProfileVisibility.Value;
+        });            
+    }
+
+    public void MarkAllReuploads(GameUser user)
+    {
+        IQueryable<GameLevel> levels = this.GameLevels.Where(l => l.Publisher == user);
+            
+        this.Write(() =>
+        {
+            foreach (GameLevel level in levels)
+            {
+                level.IsReUpload = true;
+                // normally, we'd also set the original publisher when marking a reupload.
+                // but since were doing this blindly, we shouldn't because the level might already be a reupload.
+                // we'd be setting it to null here, which could be loss of information.
+            }
+        });
+    }
+
+    public void SetUserPresenceAuthToken(GameUser user, string? token)
+    {
+        this.Write(() =>
+        {
+            user.PresenceServerAuthToken = token;
+        });
+    }
+
+    public EntityUploadRateLimit? GetUploadRateLimit(GameUser user, GameDatabaseEntity entity, bool save = true)
+    {
+        EntityUploadRateLimit? limit = this.EntityUploadRateLimits.FirstOrDefault(r => r.UserId == user.UserId && r.Entity == entity);
+    
+        // remove if expired
+        if (limit != null && limit.ExpiryDate <= this._time.Now)
+        {
+            this.EntityUploadRateLimits.Remove(limit);
+            if (save) this.SaveChanges();
+            return null;
+        }
+
+        return limit;
+    }
+
+    /// <returns>
+    /// Time until expiry date if the corresponding upload rate-limit has been reached, otherwise null
+    /// </returns>
+    public TimeSpan? GetRemainingTimeIfUploadRateLimitReached(GameUser user, GameDatabaseEntity entity, int uploadQuota)
+    {
+        EntityUploadRateLimit? limit = this.GetUploadRateLimit(user, entity); // will be null if expired already, see above
+        DateTimeOffset now = this._time.Now;
+
+        if (limit != null && limit.UploadCount >= uploadQuota)
+        {
+            return limit.ExpiryDate - now;
+        }
+
+        return null;
+    }
+    
+    public void IncrementUploadRateLimitForEntity(GameUser user, GameDatabaseEntity entity, int timeSpanHours)
+    {
+        EntityUploadRateLimit? existingLimit = this.GetUploadRateLimit(user, entity, false); // will be null if expired already, see above
+        DateTimeOffset now = this._time.Now;
+
+        if (existingLimit == null)
+        {
+            EntityUploadRateLimit newLimit = new()
+            {
+                Entity = entity,
+                User = user,
+                UploadCount = 1,
+                ExpiryDate = now + TimeSpan.FromHours(timeSpanHours),
+            };
+            this.EntityUploadRateLimits.Add(newLimit);
+        }
+        else
+        {
+            this.EntityUploadRateLimits.Update(existingLimit);
+            existingLimit.UploadCount++;
+        }
+
+        this.SaveChanges();
+    }
+
+    public void ResetUploadRateLimit(GameUser user, GameDatabaseEntity entity)
+    {
+        this.EntityUploadRateLimits.RemoveRange(r => r.UserId == user.UserId && r.Entity == entity);
+    }
+}
